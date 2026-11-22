@@ -72,7 +72,7 @@ local CFG = {
         { id = "garage",  label = "Garage",  radius = 5, pos = garagePos, physics = { car = true, tank = true } },
         { id = "helipad", label = "Helipad", radius = 15, pos = helipadPos, physics = { helicopter = true }, mustBeGrounded = true },
         -- I decided the dock had to autoDeliver: the driver is ejected and moved to `exitPos` so the player isn't swimming to land. Then the boat is deleted and stockpiled.
-        { id = "dock",    label = "Boat Dock", radius = 10, pos = dockPos, autoDeliver = true, exitPos = { 2531.0, -32.0, -799.0 }, physics = { boat = true } },
+        { id = "dock",    label = "Boat Dock", radius = 10, pos = dockPos, autoDeliver = true, unresolvedExitPos = { "PMC Dock Exit 1" }, fixedExitPos = { 2531.0, -32.0, -799.0 }, physics = { boat = true } },
     },
 }
 
@@ -110,7 +110,7 @@ local function showMarker(zone)
         if zone.nextTry and tickCount < zone.nextTry then return end
         zone.marker = Ess.Mark.zone(zone.pos.x, zone.pos.y, zone.pos.z, zone.radius, {
             kind = "deliverable", icon = true, rgb = CFG.rgb, discAlpha = CFG.discAlpha,
-            label = "Stockpile Reception: " .. zone.label,
+            label = "Stockpile: " .. zone.label,
         })
         zone.markerCheck = 0
         if not zone.marker then zone.nextTry = tickCount + 20 end   -- spawn failed; retry in ~10 s
@@ -147,7 +147,7 @@ local RANDOMIZED_SETS = {
     bike      = { "Sportbike (Civ)", "Chopper", "Offroad Motorcycle (GR)", "Offroad Motorcycle (AL)", "Scooter" },
     civilian  = { "Valiant", "Valiant (4door)", "RTR (Civ)", "Phoenix", "CRX", "Pony (normal)", "Taxi (Tercel)",
                   "R90", "Thunder", "Ridgeline", "El Grande", "ESV (lowrider)" },
-    dinghy    = { "Dinghy", "Small Fishing Boat", "turbosquid (civ)", "dinghy" },
+    dinghy    = { "Dinghy", "Small Fishing Boat", "turbosquid (civ)" },
     jetskiciv = { "Jetski (Civ)", "Jetski (PR)" },
     junkers   = { "Phoenix (crappy)", "RTR (crappy)", "Valiant (crappy)", "Pony (crappy)", "Van (crappy)" },
     luxury    = { "L300", "W8 (normal)", "W12 (normal)", "Vanquish", "ESV (Lowrider)" },
@@ -362,12 +362,17 @@ local function complete(p)
     if #added > 0 then fanfare(added) end
 end
 
--- Put the player on the zone's fixed exit point. Ess.Player.teleport is Ess's reliable way to move a player
--- (MrxUtil.TeleportHeroesToLocations; raw SetPosition is unreliable on characters). It moves every connected
--- hero, so in co-op both players arrive at the exit.
-local function movePlayer(zone)
-    local e = zone.exitPos
-    if e then Ess.Player.teleport(e[1], e[2], e[3], 0) end
+-- Put the player on the zone's exit point (the same call the game's garage uses): Object.SetTransformToObject
+-- onto the first named exit object, as v5 did. If that exit object can't be found, fall back to the fixed
+-- exitPos coordinates with Ess.Player.teleport.
+local function movePlayer(char, zone)
+    if not (char and Ess.Object.valid(char)) then return end
+    local sExit = zone.unresolvedExitPos
+    if sExit and Ess.Guid(sExit) then
+        Ess.Safe.quiet(Object.SetTransformToObject, char, sExit)
+    elseif zone.fixedExitPos then
+        Ess.Player.teleport(zone.fixedExitPos[1], zone.fixedExitPos[2], zone.fixedExitPos[3], 0)
+    end
 end
 
 -- autoDeliver zones (the boat dock): no waiting for the player. Build the array, eject the driver, move them
@@ -377,7 +382,7 @@ local function deliverNow(veh, driver, zone, key, sSupport, sName)
     local p = newDelivery(veh, zone, key, sSupport, sName)
     Ess.Vehicle.exit(veh, driver)
     Ess.Event.on(Event.TimerRelative, { CFG.settleDelay }, function()
-        movePlayer(zone)
+        movePlayer(driver, zone)
         complete(p)
     end)
 end
