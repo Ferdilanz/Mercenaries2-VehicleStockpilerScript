@@ -2,15 +2,21 @@ import("ess")
 -- local KEYVAL = "f3"
 Ess.DEBUG = true
 local Ess = _G.Ess
-if not (Ess and Ess.Math and Ess.Player and Ess.Object) then
+if not (Ess and Ess.Player and Ess.Object) then
     if Loader and Loader.Printf then Loader.Printf("[Vehicle Stockpiler] Install the 'Mercenaries 2 Lua Essentials' shipment to use this script.") end
     return
 end
 
--- CREATED BY Ferdilanz 
+--[[
+    CREATED BY
+    Ferdilanz
+    FOR THE "menace.pro" Discord
+    
+    ARTIFICIAL INTELLIGENCE WAS USED TO MAKE THIS SCRIPT
+    CONTENTS GONE OVER WITH FINE-TOOTHED EYES TO VERIFY FORM AND FUNCTION
+--]]
 
--- If this file is run a second time in the same world, tear the previous run down first so markers and
--- loops do not double up.
+-- If this file is run a second time in the same world, tear the previous run down first so markers and loops do not double up.
 if _G.VehicleStockpiler and _G.VehicleStockpiler.stop then
     pcall(_G.VehicleStockpiler.stop)
 end
@@ -19,12 +25,14 @@ pcall(import, "MrxPmc")
 pcall(import, "MrxSupportData")
 
 -- ---------------------------------------------------------------------------------------------------------
--- HOW IT WORKS -- two listeners
---   WATCH (always running): is a player in a vehicle? (Ess.Player.inVehicle(i) not nil / false / 0)
---       in a vehicle -> the three delivery-point markers are shown and the SCAN listener is switched on
---       on foot      -> the markers are removed and the SCAN listener is switched off
---   SCAN (only while a player is in a vehicle): has a player-driven vehicle entered a delivery point?
---       Garage / helipad: on entry the delivery array is built  { { vTemplate = <template>, nQty = 1, ... } }
+-- HOW IT WORKS -- two event listeners
+--   WATCHER (always running): is a player in a vehicle? (Ess.Player.inVehicle(i) not nil / false / 0)
+--       While in a vehicle -> the three delivery-point markers are shown and the SCAN listener is switched on.
+--       While on foot      -> the markers are removed and the SCAN listener is switched off
+--   SCANNER (For performance reasons, only while a player is in a vehicle): 
+--              has a player-driven vehicle entered a delivery point?
+--       Garage / helipad: Build the delivery array on entry to the delivery point  
+--                          { { vTemplate = <template>, nQty = 1, ... } }
 --           and the player stays in control. When the player is no longer in that vehicle it is deleted,
 --           added to the stockpile, and the "stockpile" fanfare banner is shown. Driving out of
 --           the point first cancels it; driving back in re-arms it.
@@ -45,31 +53,30 @@ local CFG = {
     watchId      = "VehicleStockpiler.watch",
     scanId       = "VehicleStockpiler.scan",
     interval     = 0.5,      -- seconds between checks (both listeners)
-    settleDelay  = 0.25,     -- seconds between the player getting out and the vehicle being deleted
+    settleDelay  = 0.35,     -- seconds between the player getting out and the vehicle being deleted
     fadeTime     = 0.25,     -- vehicle fade-out (then destroyed), same idea as the game's own 0.2
     leaveMargin  = 3,        -- a pending delivery is cancelled once the vehicle is this far outside the radius
     scanRange    = 60,       -- only query a point for vehicles when a player is this close
     rgb          = { 60, 184, 120 }, -- "Secondary Objective Green" sourced from the Mercs 1 HUD.ini
     discAlpha    = 0.25,
+    -- EXPERIMENT. Some vehicles can't be stockpiled by themselves because the call-in picks them at random
+    -- from a set (the game's civilian / sports / luxury / utility / junkers / monster / bike / dinghy /
+    -- jetski call-ins). With this on, a vehicle that belongs to such a set is credited to that set's
+    -- stockpile entry (e.g. a Phoenix adds one "civilian"), and calling that entry in later delivers a
+    -- random vehicle from the set again. 
+    -- Set to false to restore the old behavior.
+    bAllowRandomizedSets = true,
 
     -- Every delivery point is a fixed world position and radius; nothing is looked up at runtime.
     zones = {
-        { id = "garage",  label = "Garage",  radius = 5,
-          pos = garagePos,
-          physics = { car = true, tank = true } },
-        { id = "helipad", label = "Helipad", radius = 15,
-          pos = helipadPos,
-          physics = { helicopter = true }, mustBeGrounded = true },
-        -- The dock delivers the moment a boat enters the marker (autoDeliver): the driver is ejected and
-        -- moved to `exitPos`, then the boat is deleted and stockpiled.
-        { id = "dock",    label = "Boat Dock", radius = 10,
-          pos = dockPos,
-          autoDeliver = true, exitPos = { 2531.0, -32.0, -799.0 }, -- actual position embedded inside the source
-          physics = { boat = true } },
+        { id = "garage",  label = "Garage",  radius = 5, pos = garagePos, physics = { car = true, tank = true } },
+        { id = "helipad", label = "Helipad", radius = 15, pos = helipadPos, physics = { helicopter = true }, mustBeGrounded = true },
+        -- I decided the dock had to autoDeliver: the driver is ejected and moved to `exitPos` so the player isn't swimming to land. Then the boat is deleted and stockpiled.
+        { id = "dock",    label = "Boat Dock", radius = 10, pos = dockPos, autoDeliver = true, exitPos = { 2531.0, -32.0, -799.0 }, physics = { boat = true } },
     },
 }
 
--- The support types the game's garage inventory treats as vehicles (wifpmcgarage.lua, OpenVehicleInventory).
+-- These are the supportTypes the game's stockpile treats as savable vehicles (wifpmcgarage.lua, OpenVehicleInventory).
 local VEHICLE_SUPPORT_TYPES = { Civilian = true, Heavy = true, Light = true, Heli = true, Boat = true }
 
 local busy      = {}   -- [vehicleKey] = true while a delivery is armed or being completed
@@ -103,7 +110,7 @@ local function showMarker(zone)
         if zone.nextTry and tickCount < zone.nextTry then return end
         zone.marker = Ess.Mark.zone(zone.pos.x, zone.pos.y, zone.pos.z, zone.radius, {
             kind = "deliverable", icon = true, rgb = CFG.rgb, discAlpha = CFG.discAlpha,
-            label = "Stockpile Delivery: " .. zone.label,
+            label = "Stockpile Reception: " .. zone.label,
         })
         zone.markerCheck = 0
         if not zone.marker then zone.nextTry = tickCount + 20 end   -- spawn failed; retry in ~10 s
@@ -130,7 +137,49 @@ end
 -- Vehicle checks
 -- ---------------------------------------------------------------------------------------------------------
 -- Match a vehicle to its stockpile entry the way the game's _FindVehicleInSupport does: the vehicle's
--- localized-name hash against String.GetHash of each support entry's sName.
+-- localized-name hash against String.GetHash of each support entry's sName. Failing that (experiment, see
+-- CFG.allowRandomizedSets), match it against the game's randomized vehicle sets.
+-- Randomized sets, read from the game's own support data. A vehicle call-in whose cargo is a LIST of template
+-- names (oSupport.sCargoToDeliver is a table; MrxSupportDelivery.PickCargo picks a random element) is a
+-- randomized set. Built lazily as a flat list of { template guid, support id, support name }.
+local setTemplates = nil
+
+local function buildSetTemplates()
+    local data = MrxSupportData and MrxSupportData.tSupportData
+    if type(data) ~= "table" then return nil end
+    local ids = {}
+    for sId in pairs(data) do ids[#ids + 1] = sId end
+    table.sort(ids)   -- deterministic if a template ever appears in two sets (first id wins)
+
+    local list = {}
+    for _, sId in ipairs(ids) do
+        local t = data[sId]
+        local cargo = t.oSupport and t.oSupport.sCargoToDeliver
+        if VEHICLE_SUPPORT_TYPES[t.sType] and type(cargo) == "table" then
+            for _, sTemplate in ipairs(cargo) do
+                local ok, u = Ess.Safe.quiet(Pg.GetGuidByName, sTemplate)
+                if ok and u then list[#list + 1] = { guid = u, id = sId, name = t.sName } end
+            end
+        end
+    end
+    if #list == 0 then return nil end   -- support data not ready yet; try again next time
+    log("randomized sets loaded: " .. #list .. " vehicle templates")
+    return list
+end
+
+-- A vehicle's template (Object.GetParent, the lookup the game's garage uses) compared with each set member's
+-- template guid (Pg.GetGuidByName) -- the same == comparison the game itself uses (mrxtaskobjective.lua).
+local function findRandomizedSet(veh)
+    setTemplates = setTemplates or buildSetTemplates()
+    if not setTemplates then return nil end
+    local uTemplate = Ess.Object.parent(veh)
+    if not uTemplate then return nil end
+    for _, e in ipairs(setTemplates) do
+        if e.guid == uTemplate then return e.id, e.name end
+    end
+    return nil
+end
+
 local function findSupport(veh)
     local ok, hash = Ess.Safe.quiet(Object.GetLocalizedName, veh, true)
     if not ok or hash == nil then return nil end
@@ -142,6 +191,8 @@ local function findSupport(veh)
             if ok2 and h2 == hash then return sId, t.sName end
         end
     end
+    -- Not a stockpile entry in its own right: is it one of the randomized sets?
+    if CFG.bAllowRandomizedSets then return findRandomizedSet(veh) end
     return nil
 end
 
