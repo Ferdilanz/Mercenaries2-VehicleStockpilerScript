@@ -1,16 +1,18 @@
 import("ess")
-local KEYVAL = ""
+local KEYVAL = "f3"
 Ess.DEBUG = true
 local Ess = _G.Ess
-if not (Ess and Ess.Math and Ess.Player and Ess.Object) then
+if not (Ess and Ess.Math and Ess.Player and Ess.Object and Ess.Keys and Ess.Time) then
     if Loader and Loader.Printf then Loader.Printf("[VSSmod] Install the 'Mercenaries 2 Lua Essentials' shipment to use this script.") end
     return
 end
 
 -- If this file is run a second time in the same world, tear the previous run down first so markers and the
--- loop do not double up.
-if _G.VehicleStockpiler and _G.VehicleStockpiler.stop then
-    pcall(_G.VehicleStockpiler.stop)
+-- loop do not double up. `prior` is kept so the bottom of the file can tell "KEYVAL re-ran this script" (a
+-- toggle) from "fresh load" (arm it).
+local prior = _G.VehicleStockpiler
+if prior and prior.stop then
+    pcall(prior.stop)
 end
  
 pcall(import, "MrxPmc")
@@ -22,8 +24,9 @@ pcall(import, "MrxSupportData")
 local CFG = {
     loopId       = "VehicleStockpiler",
     scanInterval = 0.5,      -- seconds between checks
-    ejectDelay   = 0.35,     -- seconds between ejecting the driver and deleting the vehicle
+    ejectDelay   = 0.35,     -- seconds between ejecting the driver and deleting the vehicle (zones with eject)
     fadeTime     = 0.25,     -- vehicle fade-out (then destroyed), same idea as the game's own 0.2
+    settleDelay  = 0.4,      -- seconds after the vehicle is deleted before the stockpile is checked and added to
     markerRange  = 400,      -- draw a delivery point's markers when a player is this close...
     markerHide   = 500,      -- ...and remove them again beyond this (hysteresis, avoids flicker)
     scanRange    = 60,       -- only query a point for vehicles when a player is this close
@@ -31,15 +34,19 @@ local CFG = {
     discAlpha    = 0.25,
  
     zones = {
+        -- eject = true : the driver is stepped out and moved to the HQ exit point before the vehicle is deleted.
+        -- eject = false: the vehicle is simply taken out from under the player (no exit, no teleport).
+        -- pos = {x,y,z} : use these world coordinates for the point instead of looking up `dropoff` by name.
         { id = "garage",  label = "Garage",  dropoff = "PMC Garage Dropoff",  radius = 5,
           exits = { "PMC Garage Exit 1", "PMC Garage Exit 2" },
-          physics = { car = true, tank = true } },
+          physics = { car = true, tank = true }, eject = false },
         { id = "helipad", label = "Helipad", dropoff = "PMC Helipad Dropoff", radius = 15,
           exits = { "PMC Helipad Exit 1", "PMC Helipad Exit 2" },
-          physics = { helicopter = true }, mustBeGrounded = true },
+          physics = { helicopter = true }, mustBeGrounded = true, eject = true },
         { id = "dock",    label = "Boat Dock", dropoff = "PMC Dock Dropoff",  radius = 10,
           exits = { "PMC Dock Exit 1", "PMC Dock Exit 2" },
-          physics = { boat = true } },
+          physics = { boat = true }, eject = true,
+          pos = { x = 2546.6, y = -36.3, z = -789.4 } },
     },
 }
  
@@ -67,6 +74,11 @@ end
 -- cached coordinates are used.
 local function resolveZone(zone)
     if zone.x then return true end
+    if zone.pos then   -- fixed coordinates: no dependency on the named dropoff object being found/streamed
+        zone.x, zone.y, zone.z = zone.pos.x, zone.pos.y, zone.pos.z
+        log(zone.id .. " delivery point fixed at " .. zone.x .. ", " .. zone.y .. ", " .. zone.z)
+        return true
+    end
     local u = Ess.Guid(zone.dropoff)
     if not u then return false end
     local x, y, z = Ess.Object.pos(u)
@@ -153,17 +165,11 @@ end
 -- ---------------------------------------------------------------------------------------------------------
 -- Fanfare
 -- ---------------------------------------------------------------------------------------------------------
--- Music sting + the game's own "stockpile" fanfare banner. sType "stockpile" is one of the shipped
--- EventFanfare styles (an unknown sType crashes Hud.EventFanfare:Commence), and the text format matches the
--- game's own stockpile fanfare: "<support name> (x <qty>)". sName is a localization key like
--- "[vehicle.coandaattack]"; the HUD resolves it, exactly as it does for the game's fanfare.
+-- The fanfare is Ess.Hud.banner: the same Hud.EventFanfare banner, centered text, no music. sName is a
+-- localization key like "[vehicle.coandaattack]" (the support entry's sName); the HUD resolves it.
 local function fanfare(tDelivery)
-    if Ess.Easy and Ess.Easy.Fun and Ess.Easy.Fun.fanfare then Ess.Easy.Fun.fanfare(true) end
     for _, item in ipairs(tDelivery) do
-        local sText = tostring(item.sName) .. " (x " .. tostring(item.nQty) .. ")"
-        Ess.Safe.named("VehicleStockpiler.fanfare", function()
-            Hud.EventFanfare:Commence({ sType = "stockpile", vText = sText })
-        end)
+        Ess.Hud.banner(tostring(item.sName) .. " added to the stockpile (x " .. tostring(item.nQty) .. ")")
     end
 end
  
@@ -186,45 +192,54 @@ local function deliver(veh, driver, zone, key, sSupport, sName)
           nBefore = qtyOf(sSupport) },
     }
  
-    -- Get the occupants out first so nobody is deleted along with the vehicle.
-    Ess.Vehicle.exit(veh, driver)
-    Ess.Vehicle.evictAll(veh)
- 
-    -- The driver stepping out inside the HQ's own garage regions can make the game's garage script count the
-    -- vehicle itself, so the stockpile is checked again after the exit has settled (see below).
-    Ess.Event.on(Event.TimerRelative, { CFG.ejectDelay }, function()
-        -- Put the driver on dry land at the HQ exit point (same call the game's garage uses).
-        if driver and Ess.Object.valid(driver) and zone.exits[1] then
-            Ess.Safe.quiet(Object.SetTransformToObject, driver, zone.exits[1])
-        end
- 
-        -- 2. Delete the vehicle from the world.
-        local removed = false
-        if Ess.Object.valid(veh) then
-            Ess.Object.fadeOut(veh, CFG.fadeTime, true)   -- fade, then destroyed
-            removed = true
-        end
- 
-        -- 3. Add every entry in the array to the stockpile.
+    -- Zones with eject = true get the occupants out first so nobody is deleted along with the vehicle. Zones
+    -- with eject = false (the garage) leave the player seated and just take the vehicle away.
+    if zone.eject then
+        Ess.Vehicle.exit(veh, driver)
+        Ess.Vehicle.evictAll(veh)
+    end
+
+    -- 3 and 4. Once the vehicle is gone and things have settled: add every entry in the array to the
+    -- stockpile, then show the fanfare. The game's own garage script can stockpile a vehicle by itself when
+    -- its driver leaves inside the HQ regions (and deleting a vehicle with its driver aboard forces that
+    -- exit), so the stockpile is compared with the "before" figure first and never counted twice.
+    local function stockpile(removed)
         local added = {}
         for _, item in ipairs(tDelivery) do
             local nNow = qtyOf(item.sSupport)
             if nNow - item.nBefore >= item.nQty then
-                -- The game's own garage already stockpiled it while the driver stepped out.
                 log(item.sSupport .. " already counted by the garage script; not adding twice")
                 added[#added + 1] = item
             elseif removed and MrxPmc and MrxPmc.AddSupportQty then
-                -- bDspFanfare = false: the fanfare below is shown once, by this script.
+                -- bDspFanfare = false: the banner below is shown once, by this script.
                 local ok = Ess.Safe.quiet(MrxPmc.AddSupportQty, item.sSupport, item.nQty, false)
                 if ok then added[#added + 1] = item end
             else
                 log("vehicle vanished before delivery completed; nothing stockpiled")
             end
         end
- 
-        -- 4. Fanfare.
         if #added > 0 then fanfare(added) end
-    end)
+    end
+
+    -- 2. Delete the vehicle from the world, then let it settle before the stockpile step.
+    local function remove()
+        if zone.eject and driver and Ess.Object.valid(driver) and zone.exits[1] then
+            -- Put the driver on dry land at the HQ exit point (same call the game's garage uses).
+            Ess.Safe.quiet(Object.SetTransformToObject, driver, zone.exits[1])
+        end
+        local removed = false
+        if Ess.Object.valid(veh) then
+            Ess.Object.fadeOut(veh, CFG.fadeTime, true)   -- fade, then destroyed
+            removed = true
+        end
+        Ess.Event.on(Event.TimerRelative, { CFG.fadeTime + CFG.settleDelay }, function() stockpile(removed) end)
+    end
+
+    if zone.eject then
+        Ess.Event.on(Event.TimerRelative, { CFG.ejectDelay }, remove)
+    else
+        remove()
+    end
 end
  
 -- ---------------------------------------------------------------------------------------------------------
@@ -306,6 +321,66 @@ local function stop()
     for _, zone in ipairs(CFG.zones) do dropMarker(zone) end
 end
  
-_G.VehicleStockpiler = { CFG = CFG, start = start, stop = stop }
- 
-start()
+-- ---------------------------------------------------------------------------------------------------------
+-- On / off with KEYVAL
+-- ---------------------------------------------------------------------------------------------------------
+-- Off = the listener loop is stopped and every marker removed. A key-bound script is re-run in full on each
+-- press, while an OnLoad script is not, so this works either way: the key is also bound through Ess.Keys, and
+-- a toggle within TOGGLE_DEBOUNCE seconds of another one is treated as the same keypress.
+local TOGGLE_DEBOUNCE = 0.3
+
+local function justToggled()
+    local st = _G._VSS_toggleStamp
+    return st ~= nil and Ess.Time.elapsed(st) < TOGGLE_DEBOUNCE
+end
+
+local function markToggle(bFresh)
+    local st = _G._VSS_toggleStamp
+    if st and not bFresh then Ess.Time.mark(st) else _G._VSS_toggleStamp = Ess.Time.stamp() end
+end
+
+local api = { CFG = CFG, enabled = false, start = start, stop = stop }
+
+function api.setEnabled(bOn, bQuiet)
+    bOn = bOn and true or false
+    if bOn and not api.enabled then
+        api.enabled = true
+        start()
+    elseif not bOn and api.enabled then
+        api.enabled = false
+        stop()
+    end
+    if not bQuiet then hint("Vehicle Stockpiler: " .. (api.enabled and "ON" or "OFF")) end
+end
+
+function api.toggle()
+    if justToggled() then return end
+    markToggle()
+    api.setEnabled(not api.enabled)
+end
+
+-- Always dispatch to whichever instance is current, so a re-run never leaves a stale handler behind.
+function api.onKey()
+    local cur = _G.VehicleStockpiler
+    if cur and cur.toggle then cur.toggle() end
+end
+
+_G.VehicleStockpiler = api
+
+-- Ess.Keys bindings are wiped by a level reload, so our handler still being bound means this is a re-run in
+-- the same world (a keypress), not a fresh load.
+local vk = Ess.Keys.vk(KEYVAL)
+local rerun = prior ~= nil and vk ~= nil and Ess.Keys._map[vk] == prior.onKey
+Ess.Keys.on(KEYVAL, api.onKey)
+
+if rerun then
+    if justToggled() then
+        api.setEnabled(prior.enabled, true)      -- the key listener already handled this very press
+    else
+        markToggle()
+        api.setEnabled(not prior.enabled)        -- this re-run IS the press
+    end
+else
+    markToggle(true)                             -- fresh stamp; also swallows the press that launched us
+    api.setEnabled(true)                         -- fresh load: armed
+end
