@@ -44,25 +44,24 @@ local CFG = {
     rgb          = { 60, 184, 120 },
     discAlpha    = 0.25,
 
-    -- A zone resolves its position from the named dropoff object, unless it has a fixed `pos` = { x, y, z }.
+    -- Every delivery point is a fixed world position (x, y, z) and radius; nothing is looked up at runtime.
     zones = {
-        { id = "garage",  label = "Garage",  dropoff = "PMC Garage Dropoff",  radius = 5,
-          pos = { 2654.3125, -13.828918457031, -928.89282226563 },
+        { id = "garage",  label = "Garage",  radius = 5,
+          x = 2654.3125, y = -13.828918457031, z = -928.89282226563,
           physics = { car = true, tank = true } },
-        { id = "helipad", label = "Helipad", dropoff = "PMC Helipad Dropoff", radius = 15,
-          pos = { 2632.8032226563, 8.0310926437378, -885.96362304688 },
+        { id = "helipad", label = "Helipad", radius = 15,
+          x = 2632.8032226563, y = 8.0310926437378, z = -885.96362304688,
           physics = { helicopter = true }, mustBeGrounded = true },
-        -- The dock delivers the moment a boat enters the marker: the driver is ejected and moved to the
-        -- first exit point, then the boat is deleted and stockpiled (autoDeliver). If that exit object can't
-        -- be found, the player is moved to the marker position instead.
-        { id = "dock",    label = "Boat Dock", dropoff = "PMC Dock Dropoff",  radius = 10,
-          pos = { 2546.6, -36.1, -789.4 },
-          autoDeliver = true, exits = { "PMC Dock Exit 1", "PMC Dock Exit 2" },
+        -- The dock delivers the moment a boat enters the marker (autoDeliver): the driver is ejected and
+        -- moved to `exit`, then the boat is deleted and stockpiled.
+        { id = "dock",    label = "Boat Dock", radius = 10,
+          x = 2546.6, y = -36.1, z = -789.4,
+          autoDeliver = true, exitPos = { 2531.0, -32.0, -799.0 },
           physics = { boat = true } },
     },
 }
 
--- The support-types the game's garage-inventory treats as vehicles (wifpmcgarage.lua, OpenVehicleInventory).
+-- The support types the game's garage inventory treats as vehicles (wifpmcgarage.lua, OpenVehicleInventory).
 local VEHICLE_SUPPORT_TYPES = { Civilian = true, Heavy = true, Light = true, Heli = true, Boat = true }
 
 local busy      = {}   -- [vehicleKey] = true while a delivery is armed or being completed
@@ -81,26 +80,8 @@ local function hint(sText)
 end
 
 -- ---------------------------------------------------------------------------------------------------------
--- Delivery points: resolve, mark
+-- Delivery points: markers
 -- ---------------------------------------------------------------------------------------------------------
--- Resolve the point's position once and cache it; the point is static, so after this only the cached
--- coordinates are used.
-local function resolveZone(zone)
-    if zone.x then return true end
-    if zone.pos then
-        zone.x, zone.y, zone.z = zone.pos[1], zone.pos[2], zone.pos[3]
-        log(zone.id .. " delivery point fixed at " .. zone.x .. ", " .. zone.y .. ", " .. zone.z)
-        return true
-    end
-    local u = Ess.Guid(zone.dropoff)
-    if not u then return false end
-    local x, y, z = Ess.Object.pos(u)
-    if not x then return false end
-    zone.x, zone.y, zone.z = x, y, z
-    log(zone.id .. " delivery point resolved at " .. x .. ", " .. y .. ", " .. z)
-    return true
-end
-
 -- The graphical marker: a ground ring the same radius as the real bounds, a floating "deliverable" icon, and
 -- a radar + PDA blip. Ess.Mark.zone owns a TinyGeometry anchor; Ess.Mark.clear removes everything.
 local function dropMarker(zone)
@@ -129,7 +110,7 @@ end
 
 local function showMarkers()
     for _, zone in ipairs(CFG.zones) do
-        if resolveZone(zone) then showMarker(zone) end
+        showMarker(zone)
     end
 end
 
@@ -285,16 +266,12 @@ local function complete(p)
     if #added > 0 then fanfare(added) end
 end
 
--- Put the player on the zone's exit point (the same call the game's garage uses). If the exit object can't be
--- found, fall back to the marker position.
-local function movePlayer(char, zone)
-    if not (char and Ess.Object.valid(char)) then return end
-    local sExit = zone.exits and zone.exits[1]
-    if sExit and Ess.Guid(sExit) then
-        Ess.Safe.quiet(Object.SetTransformToObject, char, sExit)
-    else
-        Ess.Player.teleport(zone.x, zone.y, zone.z, 0)
-    end
+-- Put the player on the zone's fixed exit point. Ess.Player.teleport is Ess's reliable way to move a player
+-- (MrxUtil.TeleportHeroesToLocations; raw SetPosition is unreliable on characters). It moves every connected
+-- hero, so in co-op both players arrive at the exit.
+local function movePlayer(zone)
+    local e = zone.exit
+    if e then Ess.Player.teleport(e[1], e[2], e[3], 0) end
 end
 
 -- autoDeliver zones (the boat dock): no waiting for the player. Build the array, eject the driver, move them
@@ -304,7 +281,7 @@ local function deliverNow(veh, driver, zone, key, sSupport, sName)
     local p = newDelivery(veh, zone, key, sSupport, sName)
     Ess.Vehicle.exit(veh, driver)
     Ess.Event.on(Event.TimerRelative, { CFG.settleDelay }, function()
-        movePlayer(driver, zone)
+        movePlayer(zone)
         complete(p)
     end)
 end
@@ -387,10 +364,8 @@ end
 local function scanTick()
     local seen = {}
     for _, zone in ipairs(CFG.zones) do
-        if resolveZone(zone) then
-            local d = playerDistance(zone.x, zone.y, zone.z)
-            if d and d <= CFG.scanRange then scanZone(zone, seen) end
-        end
+        local d = playerDistance(zone.x, zone.y, zone.z)
+        if d and d <= CFG.scanRange then scanZone(zone, seen) end
     end
     -- Forget a hint once its vehicle has left the point, so it can be shown again next visit.
     for k in pairs(notified) do
