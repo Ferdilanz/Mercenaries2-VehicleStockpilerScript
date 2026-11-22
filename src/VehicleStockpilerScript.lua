@@ -143,6 +143,7 @@ end
 -- names (oSupport.sCargoToDeliver is a table; MrxSupportDelivery.PickCargo picks a random element) is a
 -- randomized set. Built lazily as a flat list of { template guid, support id, support name }.
 local setTemplates = nil
+local setsLoggedEmpty = false
 
 local function buildSetTemplates()
     local data = MrxSupportData and MrxSupportData.tSupportData
@@ -151,19 +152,37 @@ local function buildSetTemplates()
     for sId in pairs(data) do ids[#ids + 1] = sId end
     table.sort(ids)   -- deterministic if a template ever appears in two sets (first id wins)
 
-    local list = {}
+    -- Every template name is logged with the set it belongs to, and flagged MISSING if the game can't resolve
+    -- it, so a vehicle that never matches can be traced to a name that failed to load. The lines are collected
+    -- first and written once, so a retry (support data not ready yet) doesn't spam the log.
+    local list, lines, nMissing = {}, {}, 0
     for _, sId in ipairs(ids) do
         local t = data[sId]
         local cargo = t.oSupport and t.oSupport.sCargoToDeliver
         if VEHICLE_SUPPORT_TYPES[t.sType] and type(cargo) == "table" then
             for _, sTemplate in ipairs(cargo) do
                 local ok, u = Ess.Safe.quiet(Pg.GetGuidByName, sTemplate)
-                if ok and u then list[#list + 1] = { guid = u, id = sId, name = t.sName } end
+                if ok and u then
+                    list[#list + 1] = { guid = u, id = sId, name = t.sName }
+                    lines[#lines + 1] = "  [" .. sId .. "] " .. tostring(sTemplate) .. "  ->  resolved"
+                else
+                    nMissing = nMissing + 1
+                    lines[#lines + 1] = "  [" .. sId .. "] " .. tostring(sTemplate) .. "  ->  MISSING (no template by that name)"
+                end
             end
         end
     end
-    if #list == 0 then return nil end   -- support data not ready yet; try again next time
-    log("randomized sets loaded: " .. #list .. " vehicle templates")
+    if #list == 0 then
+        -- support data not ready yet (or nothing resolved); try again next time, but say so only once
+        if #lines > 0 and not setsLoggedEmpty then
+            setsLoggedEmpty = true
+            log("randomized set templates, none resolved:")
+            for _, l in ipairs(lines) do log(l) end
+        end
+        return nil
+    end
+    log("randomized set templates: " .. #list .. " resolved, " .. nMissing .. " missing")
+    for _, l in ipairs(lines) do log(l) end
     return list
 end
 
