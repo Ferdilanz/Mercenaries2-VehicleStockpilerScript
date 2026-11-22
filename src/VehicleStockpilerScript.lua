@@ -138,51 +138,69 @@ end
 -- ---------------------------------------------------------------------------------------------------------
 -- Match a vehicle to its stockpile entry the way the game's _FindVehicleInSupport does: the vehicle's
 -- localized-name hash against String.GetHash of each support entry's sName. Failing that (experiment, see
--- CFG.allowRandomizedSets), match it against the game's randomized vehicle sets.
--- Randomized sets, read from the game's own support data. A vehicle call-in whose cargo is a LIST of template
--- names (oSupport.sCargoToDeliver is a table; MrxSupportDelivery.PickCargo picks a random element) is a
--- randomized set. Built lazily as a flat list of { template guid, support id, support name }.
+-- CFG.bAllowRandomizedSets), match it against the game's randomized vehicle sets.
+-- Randomized sets. The category of a vehicle (e.g. "Phoenix (crappy)" -> "junkers") is the key of its entry in
+-- MrxSupportData.tSupportData, whose oSupport.sCargoToDeliver is the list of template names the call-in picks
+-- from (MrxSupportDelivery.PickCargo). Source: resident/mrxsupportdata.lua. This table is the built-in copy of
+-- that data; the live data is read as well (below) and anything it adds is merged in.
+local RANDOMIZED_SETS = {
+    bike      = { "Sportbike (Civ)", "Chopper", "Offroad Motorcycle (GR)", "Offroad Motorcycle (AL)", "Scooter" },
+    civilian  = { "Valiant", "Valiant (4door)", "RTR (Civ)", "Phoenix", "CRX", "Pony (normal)", "Taxi (Tercel)",
+                  "R90", "Thunder", "Ridgeline", "El Grande", "ESV (lowrider)" },
+    dinghy    = { "Dinghy", "Small Fishing Boat", "turbosquid (civ)", "dinghy" },
+    jetskiciv = { "Jetski (Civ)", "Jetski (PR)" },
+    junkers   = { "Phoenix (crappy)", "RTR (crappy)", "Valiant (crappy)", "Pony (crappy)", "Van (crappy)" },
+    luxury    = { "L300", "W8 (normal)", "W12 (normal)", "Vanquish", "ESV (Lowrider)" },
+    monster   = { "Monster Ridgeline", "EXT (Monster)", "Cougar" },
+    sports    = { "Vanquish (racing)", "Veyron", "W12 (sprint)", "W12 (Z12) Racer", "W12 (Z12)", "Phoenix (racing)",
+                  "RTR (racing)", "L300 (Racing)", "CRX (racing)" },
+    utility   = { "Van (Commercial)", "Van (Green)", "Van (Racing)", "Van (Taxi)", "Garbage Truck", "Impact",
+                  "Impact (SUT)", "Escort", "Ambulance", "Armored Bank Truck", "Transport Truck" },
+}
+
+-- Flat list of { guid = template guid, id = category key, name = stockpile name key, template = template name }.
+-- Built lazily. Only categories that exist as a stockpile entry in the game's support data are usable.
 local setTemplates = nil
-local setsLoggedEmpty = false
 
 local function buildSetTemplates()
     local data = MrxSupportData and MrxSupportData.tSupportData
     if type(data) ~= "table" then return nil end
-    local ids = {}
-    for sId in pairs(data) do ids[#ids + 1] = sId end
-    table.sort(ids)   -- deterministic if a template ever appears in two sets (first id wins)
 
-    -- Every template name is logged with the set it belongs to, and flagged MISSING if the game can't resolve
-    -- it, so a vehicle that never matches can be traced to a name that failed to load. The lines are collected
-    -- first and written once, so a retry (support data not ready yet) doesn't spam the log.
-    local list, lines, nMissing = {}, {}, 0
-    for _, sId in ipairs(ids) do
-        local t = data[sId]
+    -- category key -> { template names }: built-in table first, then whatever the live data adds.
+    local cats, seen = {}, {}
+    local function add(sId, sTemplate)
+        local k = sId .. "\0" .. sTemplate
+        if seen[k] then return end
+        seen[k] = true
+        cats[sId] = cats[sId] or {}
+        cats[sId][#cats[sId] + 1] = sTemplate
+    end
+    for sId, names in pairs(RANDOMIZED_SETS) do
+        for _, n in ipairs(names) do add(sId, n) end
+    end
+    for sId, t in pairs(data) do
         local cargo = t.oSupport and t.oSupport.sCargoToDeliver
         if VEHICLE_SUPPORT_TYPES[t.sType] and type(cargo) == "table" then
-            for _, sTemplate in ipairs(cargo) do
+            for _, n in ipairs(cargo) do add(sId, n) end
+        end
+    end
+
+    local ids = {}
+    for sId in pairs(cats) do ids[#ids + 1] = sId end
+    table.sort(ids)   -- deterministic if a template ever appears in two sets (first id wins)
+
+    local list = {}
+    for _, sId in ipairs(ids) do
+        local t = data[sId]
+        if t and t.sName and VEHICLE_SUPPORT_TYPES[t.sType] then
+            for _, sTemplate in ipairs(cats[sId]) do
                 local ok, u = Ess.Safe.quiet(Pg.GetGuidByName, sTemplate)
-                if ok and u then
-                    list[#list + 1] = { guid = u, id = sId, name = t.sName }
-                    lines[#lines + 1] = "  [" .. sId .. "] " .. tostring(sTemplate) .. "  ->  resolved"
-                else
-                    nMissing = nMissing + 1
-                    lines[#lines + 1] = "  [" .. sId .. "] " .. tostring(sTemplate) .. "  ->  MISSING (no template by that name)"
-                end
+                if ok and u then list[#list + 1] = { guid = u, id = sId, name = t.sName, template = sTemplate } end
             end
         end
     end
-    if #list == 0 then
-        -- support data not ready yet (or nothing resolved); try again next time, but say so only once
-        if #lines > 0 and not setsLoggedEmpty then
-            setsLoggedEmpty = true
-            log("randomized set templates, none resolved:")
-            for _, l in ipairs(lines) do log(l) end
-        end
-        return nil
-    end
-    log("randomized set templates: " .. #list .. " resolved, " .. nMissing .. " missing")
-    for _, l in ipairs(lines) do log(l) end
+    if #list == 0 then return nil end   -- support data not ready yet; try again next time
+    log("randomized sets loaded: " .. #list .. " vehicle templates")
     return list
 end
 
