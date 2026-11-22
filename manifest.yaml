@@ -1,0 +1,20 @@
+format: 2
+
+shipment:
+  name: vss
+  title: Vehicle Stockpiler Script
+  version: 0.11
+  target: retail
+  authors: [Ferdilanz]
+  description: >-
+    An OnLoad Lua script that allows the player to return vehicles from the world to the stockpile.
+  license: AGPL-3.0
+  tags: [ess, lua, onload, ui]
+
+load:
+  requires:
+  - { shipment: lua-bridge, version: "^1.1.1" }
+  - { shipment: ess, version: "^0.7.0"}
+
+contributions:
+  - { kind: add_script, name: vss, source: src/VehicleStockpilerScript.lua }
