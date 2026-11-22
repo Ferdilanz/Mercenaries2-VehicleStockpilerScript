@@ -2,13 +2,13 @@ import("ess")
 local KEYVAL = ""
 Ess.DEBUG = true
 local Ess = _G.Ess
-if not (Ess and Ess.Math and Ess.Player and Ess.Object and Ess.Keys) then
+if not (Ess and Ess.Math and Ess.Player and Ess.Object) then
     if Loader and Loader.Printf then Loader.Printf("[VSSmod] Install the 'Mercenaries 2 Lua Essentials' shipment to use this script.") end
     return
 end
 
--- If this file is run a second time in the same world, tear the previous run down first so markers, the
--- loop and the toggle key do not double up.
+-- If this file is run a second time in the same world, tear the previous run down first so markers and
+-- loops do not double up.
 if _G.VehicleStockpiler and _G.VehicleStockpiler.stop then
     pcall(_G.VehicleStockpiler.stop)
 end
@@ -17,60 +17,61 @@ pcall(import, "MrxPmc")
 pcall(import, "MrxSupportData")
 
 -- ---------------------------------------------------------------------------------------------------------
--- HOW IT WORKS
---   1. Drive a vehicle into a delivery point (garage / helipad / boat dock). On entry the delivery array is
---      built:  { { vTemplate = <vehicle template>, nQty = 1, ... } }
---   2. The player stays in control. Nobody is ejected. (Exception: the boat dock, which delivers at once --
---      see `autoDeliver` on the dock zone.)
---   3. When the player is no longer in that vehicle (Ess.Player.inVehicle(i) turns nil/false/0), the vehicle
---      is deleted from the world, every entry in the array is added to the stockpile, and the "stockpile"
---      fanfare banner is shown (Hud.EventFanfare:Commence only -- no music).
---   4. Driving out of the point before stepping out cancels the delivery; driving back in re-arms it.
---   KEYVAL toggles the whole script on/off.
+-- HOW IT WORKS -- two listeners
+--   WATCH (always running): is a player in a vehicle? (Ess.Player.inVehicle(i) not nil / false / 0)
+--       in a vehicle -> the three delivery-point markers are shown and the SCAN listener is switched on
+--       on foot      -> the markers are removed and the SCAN listener is switched off
+--   SCAN (only while a player is in a vehicle): has a player-driven vehicle entered a delivery point?
+--       Garage / helipad: on entry the delivery array is built  { { vTemplate = <template>, nQty = 1, ... } }
+--           and the player stays in control. When the player is no longer in that vehicle it is deleted,
+--           added to the stockpile, and the "stockpile" fanfare banner is shown (no music). Driving out of
+--           the point first cancels it; driving back in re-arms it.
+--       Boat dock (autoDeliver): the moment a boat enters the point the driver is ejected and moved to the
+--           dock exit, then the boat is deleted, stockpiled and the fanfare is shown.
 -- ---------------------------------------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------------------------------------
 -- CONFIG
 -- ---------------------------------------------------------------------------------------------------------
 local CFG = {
-    loopId       = "VehicleStockpiler",
-    scanInterval = 0.5,      -- seconds between checks
-    settleDelay  = 0.35,     -- seconds between the player stepping out and the vehicle being deleted
+    watchId      = "VehicleStockpiler.watch",
+    scanId       = "VehicleStockpiler.scan",
+    interval     = 0.5,      -- seconds between checks (both listeners)
+    settleDelay  = 0.25,     -- seconds between the player getting out and the vehicle being deleted
     fadeTime     = 0.25,     -- vehicle fade-out (then destroyed), same idea as the game's own 0.2
     leaveMargin  = 3,        -- a pending delivery is cancelled once the vehicle is this far outside the radius
-    markerRange  = 400,      -- draw a delivery point's markers when a player is this close...
-    markerHide   = 500,      -- ...and remove them again beyond this (hysteresis, avoids flicker)
     scanRange    = 60,       -- only query a point for vehicles when a player is this close
-    rgb          = { 154, 205, 50 },
+    rgb          = { 60, 184, 120 },
     discAlpha    = 0.25,
 
     -- A zone resolves its position from the named dropoff object, unless it has a fixed `pos` = { x, y, z }.
     zones = {
-        { id = "garage",  label = "Garage",  dropoff = "PMC Garage Dropoff",  radius = 5,
-          physics = { car = true, tank = true } },
+        { id = "garage",  label = "Garage",  dropoff = "PMC Garage Dropoff",  radius = 5, 
+		  pos = { 2654.3125, -13.828918457031, -928.89282226563 }, 
+		  physics = { car = true, tank = true } },
         { id = "helipad", label = "Helipad", dropoff = "PMC Helipad Dropoff", radius = 15,
-          physics = { helicopter = true }, mustBeGrounded = true },
+          pos = { 2632.8032226563, 8.0310926437378, -885.96362304688 }, 
+		  physics = { helicopter = true }, mustBeGrounded = true },
         -- The dock delivers the moment a boat enters the marker: the driver is ejected and moved to the
         -- first exit point, then the boat is deleted and stockpiled (autoDeliver). If that exit object can't
         -- be found, the player is moved to the marker position instead.
         { id = "dock",    label = "Boat Dock", dropoff = "PMC Dock Dropoff",  radius = 10,
-          pos = { 2546.6, -36.3, -789.4 },
+          pos = { 2546.6, -36.1, -789.4 },
           autoDeliver = true, exits = { "PMC Dock Exit 1", "PMC Dock Exit 2" },
           physics = { boat = true } },
     },
 }
 
--- The support types the game's garage inventory treats as vehicles (wifpmcgarage.lua, OpenVehicleInventory).
+-- The support-types the game's garage-inventory treats as vehicles (wifpmcgarage.lua, OpenVehicleInventory).
 local VEHICLE_SUPPORT_TYPES = { Civilian = true, Heavy = true, Light = true, Heli = true, Boat = true }
 
 local busy      = {}   -- [vehicleKey] = true while a delivery is armed or being completed
-local pending   = {}   -- [vehicleKey] = { veh, zone, pi, tDelivery }  armed, waiting for the player to step out
+local pending   = {}   -- [vehicleKey] = { veh, zone, pi, tDelivery }  armed, waiting for the player to get out
 local notified  = {}   -- [flagKey] = true while a "can't deliver" hint has been shown for a vehicle
 local supportOf = {}   -- [vehicleKey] = { id, name } | false   (cache; the name-hash scan is not free)
 local tickCount = 0
-local enabled   = false
 
-local function log(msg) Ess.Log("[VehicleStockpiler] " .. tostring(msg)) end
+local function log(msg) Ess.Log("[VSSmod] " .. tostring(msg)) end
 
 -- Guids are userdata, so they are not safe table keys. Key by the string form instead (Ess.Name).
 local function keyOf(u) return Ess.Name(u) or tostring(u) end
@@ -105,28 +106,35 @@ end
 local function dropMarker(zone)
     if zone.marker then Ess.Mark.clear(zone.marker) end
     zone.marker = nil
+    zone.nextTry, zone.markerCheck = nil, nil
 end
 
-local function maintainMarker(zone, nDist)
-    if nDist <= CFG.markerRange then
-        if not zone.marker then
-            if zone.nextTry and tickCount < zone.nextTry then return end
-            zone.marker = Ess.Mark.zone(zone.x, zone.y, zone.z, zone.radius, {
-                kind = "deliverable", icon = true, rgb = CFG.rgb, discAlpha = CFG.discAlpha,
-                label = "Stockpile Delivery: " .. zone.label,
-            })
+local function showMarker(zone)
+    if not zone.marker then
+        if zone.nextTry and tickCount < zone.nextTry then return end
+        zone.marker = Ess.Mark.zone(zone.x, zone.y, zone.z, zone.radius, {
+            kind = "deliverable", icon = true, rgb = CFG.rgb, discAlpha = CFG.discAlpha,
+            label = "Stockpile Delivery: " .. zone.label,
+        })
+        zone.markerCheck = 0
+        if not zone.marker then zone.nextTry = tickCount + 20 end   -- spawn failed; retry in ~10 s
+    else
+        zone.markerCheck = (zone.markerCheck or 0) + 1
+        if zone.markerCheck >= 10 then           -- every ~5 s make sure the anchor survived streaming
             zone.markerCheck = 0
-            if not zone.marker then zone.nextTry = tickCount + 20 end   -- spawn failed; retry in ~10 s
-        else
-            zone.markerCheck = (zone.markerCheck or 0) + 1
-            if zone.markerCheck >= 10 then           -- every ~5 s make sure the anchor survived streaming
-                zone.markerCheck = 0
-                if not Ess.Object.valid(zone.marker.anchor) then dropMarker(zone) end
-            end
+            if not Ess.Object.valid(zone.marker.anchor) then dropMarker(zone) end
         end
-    elseif zone.marker and nDist > CFG.markerHide then
-        dropMarker(zone)
     end
+end
+
+local function showMarkers()
+    for _, zone in ipairs(CFG.zones) do
+        if resolveZone(zone) then showMarker(zone) end
+    end
+end
+
+local function hideMarkers()
+    for _, zone in ipairs(CFG.zones) do dropMarker(zone) end
 end
 
 -- ---------------------------------------------------------------------------------------------------------
@@ -182,6 +190,13 @@ local function inVehicleKey(i)
     return keyOf(v)
 end
 
+local function anyPlayerInVehicle()
+    for i = 0, 1 do
+        if inVehicleKey(i) then return true end
+    end
+    return false
+end
+
 -- ---------------------------------------------------------------------------------------------------------
 -- Fanfare
 -- ---------------------------------------------------------------------------------------------------------
@@ -211,7 +226,7 @@ end
 -- Step 1, on entering the point: build the array holding the vehicle template and the quantity to add.
 -- Object.GetParent on a spawned vehicle is its template, the same lookup the game's garage uses for storage
 -- (wifpmcgarage.lua, _AddVehicle). nBefore is the stock at this moment, so that if the game's own garage
--- script counts the vehicle when the player steps out inside the HQ regions it is not added twice.
+-- script counts the vehicle when the player gets out inside the HQ regions it is not added twice.
 local function newDelivery(veh, zone, key, sSupport, sName)
     return {
         veh = veh, zone = zone, key = key,
@@ -255,7 +270,7 @@ local function complete(p)
     for _, item in ipairs(p.tDelivery) do
         local nNow = qtyOf(item.sSupport)
         if nNow - item.nBefore >= item.nQty then
-            -- The game's own garage script already stockpiled it when the player stepped out.
+            -- The game's own garage script already stockpiled it when the player got out.
             log(item.sSupport .. " already counted by the garage script; not adding twice")
             added[#added + 1] = item
         elseif removed and MrxPmc and MrxPmc.AddSupportQty then
@@ -294,7 +309,8 @@ local function deliverNow(veh, driver, zone, key, sSupport, sName)
     end)
 end
 
--- Runs every tick for armed deliveries (whatever the distance to the player).
+-- Armed deliveries (garage / helipad). Runs on the WATCH listener, so it keeps going after the player gets
+-- out of the vehicle -- which is exactly the moment it is waiting for.
 local function checkPending()
     for key, p in pairs(pending) do
         if not Ess.Object.valid(p.veh) then
@@ -308,8 +324,8 @@ local function checkPending()
             elseif p.zone.mustBeGrounded and Ess.Vehicle.isFlying(p.veh) then
                 cancel(key, "left a flying aircraft")
             else
-                -- The player is out of the vehicle. Let the exit settle (and the game's own garage hooks
-                -- run), then complete. busy[key] stays set so it can't be re-armed meanwhile.
+                -- The player is out of the vehicle. Let it settle (and the game's own garage hooks run),
+                -- then complete. busy[key] stays set so it can't be re-armed meanwhile.
                 pending[key] = nil
                 Ess.Event.on(Event.TimerRelative, { CFG.settleDelay }, function() complete(p) end)
             end
@@ -318,7 +334,7 @@ local function checkPending()
 end
 
 -- ---------------------------------------------------------------------------------------------------------
--- The listener
+-- SCAN listener: has a player-driven vehicle entered a delivery point?
 -- ---------------------------------------------------------------------------------------------------------
 local function once(seen, flagKey, sText)
     seen[flagKey] = true
@@ -328,7 +344,7 @@ local function once(seen, flagKey, sText)
     end
 end
 
-local function scan(zone, seen)
+local function scanZone(zone, seen)
     local vehicles = Ess.Probe.inArea(zone.x, zone.y, zone.z, zone.radius, "Vehicle")
     for _, veh in ipairs(vehicles) do
         local key = keyOf(veh)
@@ -368,17 +384,12 @@ local function playerDistance(x, y, z)
     return best
 end
 
-local function tick()
-    tickCount = tickCount + 1
-    checkPending()
+local function scanTick()
     local seen = {}
     for _, zone in ipairs(CFG.zones) do
         if resolveZone(zone) then
             local d = playerDistance(zone.x, zone.y, zone.z)
-            if d then
-                maintainMarker(zone, d)
-                if d <= CFG.scanRange then scan(zone, seen) end
-            end
+            if d and d <= CFG.scanRange then scanZone(zone, seen) end
         end
     end
     -- Forget a hint once its vehicle has left the point, so it can be shown again next visit.
@@ -387,55 +398,48 @@ local function tick()
     end
 end
 
--- ---------------------------------------------------------------------------------------------------------
--- On / off
--- ---------------------------------------------------------------------------------------------------------
-local function wipeState()
-    for k in pairs(pending)  do pending[k]  = nil end
-    for k in pairs(busy)     do busy[k]     = nil end
+local function startScan()
+    if Ess.Loop.isRunning(CFG.scanId) then return end
+    Ess.Loop.start(CFG.scanId, CFG.interval, function()
+        local ok, err = pcall(scanTick)
+        if not ok then log("scan error: " .. tostring(err)) end
+        return true   -- never let one bad tick end the listener
+    end)
+end
+
+local function stopScan()
+    if Ess.Loop.isRunning(CFG.scanId) then Ess.Loop.stop(CFG.scanId) end
     for k in pairs(notified) do notified[k] = nil end
-    for _, zone in ipairs(CFG.zones) do
-        dropMarker(zone)
-        zone.nextTry, zone.markerCheck = nil, nil
+end
+
+-- ---------------------------------------------------------------------------------------------------------
+-- WATCH listener: is a player in a vehicle?
+-- ---------------------------------------------------------------------------------------------------------
+local function watchTick()
+    tickCount = tickCount + 1
+    checkPending()
+    if anyPlayerInVehicle() then
+        showMarkers()
+        startScan()
+    else
+        stopScan()
+        hideMarkers()
     end
 end
 
-local function enable(bQuiet)
-    if enabled then return end
-    enabled = true
-    Ess.Loop.start(CFG.loopId, CFG.scanInterval, function()
-        local ok, err = pcall(tick)
-        if not ok then log("tick error: " .. tostring(err)) end
-        return true   -- never let one bad tick end the listener
-    end)
-    log("ON - delivery points armed: garage, helipad, boat dock")
-    if not bQuiet then hint("Vehicle Stockpiler: ON") end
-end
-
-local function disable(bQuiet)
-    if not enabled then return end
-    enabled = false
-    Ess.Loop.stop(CFG.loopId)
-    wipeState()   -- markers removed; any armed delivery is dropped and its vehicle left alone
-    log("OFF")
-    if not bQuiet then hint("Vehicle Stockpiler: OFF") end
-end
-
-local function toggle()
-    if enabled then disable() else enable() end
-end
-
 local function stop()
-    disable(true)
-    if Ess.Keys and Ess.Keys.off then Ess.Keys.off(KEYVAL) end
+    Ess.Loop.stop(CFG.watchId)
+    stopScan()
+    hideMarkers()
+    for k in pairs(pending) do pending[k] = nil end
+    for k in pairs(busy)    do busy[k]    = nil end
 end
 
-_G.VehicleStockpiler = { CFG = CFG, start = enable, stop = stop, toggle = toggle }
+_G.VehicleStockpiler = { CFG = CFG, stop = stop }
 
-if Ess.Keys and Ess.Keys.on then
-    Ess.Keys.on(KEYVAL, toggle)
-else
-    log("Ess.Keys is not available; the " .. tostring(KEYVAL) .. " toggle key is disabled")
-end
-
-enable(true)
+Ess.Loop.start(CFG.watchId, CFG.interval, function()
+    local ok, err = pcall(watchTick)
+    if not ok then log("watch error: " .. tostring(err)) end
+    return true   -- never let one bad tick end the listener
+end)
+log("watching for a player in a vehicle")
