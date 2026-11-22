@@ -1,5 +1,5 @@
 import("ess")
-local KEYVAL = ""
+local KEYVAL = "f3"
 Ess.DEBUG = true
 local Ess = _G.Ess
 if not (Ess and Ess.Math and Ess.Player and Ess.Object) then
@@ -46,12 +46,12 @@ local CFG = {
 
     -- A zone resolves its position from the named dropoff object, unless it has a fixed `pos` = { x, y, z }.
     zones = {
-        { id = "garage",  label = "Garage",  dropoff = "PMC Garage Dropoff",  radius = 5, 
-		  pos = { 2654.3125, -13.828918457031, -928.89282226563 }, 
-		  physics = { car = true, tank = true } },
+        { id = "garage",  label = "Garage",  dropoff = "PMC Garage Dropoff",  radius = 5,
+          pos = { 2654.3125, -13.828918457031, -928.89282226563 },
+          physics = { car = true, tank = true } },
         { id = "helipad", label = "Helipad", dropoff = "PMC Helipad Dropoff", radius = 15,
-          pos = { 2632.8032226563, 8.0310926437378, -885.96362304688 }, 
-		  physics = { helicopter = true }, mustBeGrounded = true },
+          pos = { 2632.8032226563, 8.0310926437378, -885.96362304688 },
+          physics = { helicopter = true }, mustBeGrounded = true },
         -- The dock delivers the moment a boat enters the marker: the driver is ejected and moved to the
         -- first exit point, then the boat is deleted and stockpiled (autoDeliver). If that exit object can't
         -- be found, the player is moved to the marker position instead.
@@ -71,7 +71,7 @@ local notified  = {}   -- [flagKey] = true while a "can't deliver" hint has been
 local supportOf = {}   -- [vehicleKey] = { id, name } | false   (cache; the name-hash scan is not free)
 local tickCount = 0
 
-local function log(msg) Ess.Log("[VSSmod] " .. tostring(msg)) end
+local function log(msg) Ess.Log("[VehicleStockpiler] " .. tostring(msg)) end
 
 -- Guids are userdata, so they are not safe table keys. Key by the string form instead (Ess.Name).
 local function keyOf(u) return Ess.Name(u) or tostring(u) end
