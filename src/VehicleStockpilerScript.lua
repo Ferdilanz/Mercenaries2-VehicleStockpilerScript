@@ -1,11 +1,13 @@
 import("ess")
-local KEYVAL = "f3"
+-- local KEYVAL = "f3"
 Ess.DEBUG = true
 local Ess = _G.Ess
 if not (Ess and Ess.Math and Ess.Player and Ess.Object) then
-    if Loader and Loader.Printf then Loader.Printf("[VSSmod] Install the 'Mercenaries 2 Lua Essentials' shipment to use this script.") end
+    if Loader and Loader.Printf then Loader.Printf("[Vehicle Stockpiler] Install the 'Mercenaries 2 Lua Essentials' shipment to use this script.") end
     return
 end
+
+-- CREATED BY Ferdilanz 
 
 -- If this file is run a second time in the same world, tear the previous run down first so markers and
 -- loops do not double up.
@@ -24,15 +26,21 @@ pcall(import, "MrxSupportData")
 --   SCAN (only while a player is in a vehicle): has a player-driven vehicle entered a delivery point?
 --       Garage / helipad: on entry the delivery array is built  { { vTemplate = <template>, nQty = 1, ... } }
 --           and the player stays in control. When the player is no longer in that vehicle it is deleted,
---           added to the stockpile, and the "stockpile" fanfare banner is shown (no music). Driving out of
+--           added to the stockpile, and the "stockpile" fanfare banner is shown. Driving out of
 --           the point first cancels it; driving back in re-arms it.
 --       Boat dock (autoDeliver): the moment a boat enters the point the driver is ejected and moved to the
---           dock exit, then the boat is deleted, stockpiled and the fanfare is shown.
+--           dock exit so they don't have to swim to land, then the boat is deleted, stockpiled and the 
+--           fanfare is shown.
 -- ---------------------------------------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------------------------------------
 -- CONFIG
 -- ---------------------------------------------------------------------------------------------------------
+-- Fixed world positions of the three delivery points.
+local garagePos  = { x = 2654.3125,     y = -13.828918457031, z = -928.89282226563 } -- actual position embedded inside the worldmap
+local helipadPos = { x = 2632.8032226563, y = 8.0310926437378, z = -885.96362304688 } -- actual position embedded inside the worldmap
+local dockPos    = { x = 2546.6,        y = -36.1,            z = -789.4 } -- I had to get this one manually
+
 local CFG = {
     watchId      = "VehicleStockpiler.watch",
     scanId       = "VehicleStockpiler.scan",
@@ -41,22 +49,22 @@ local CFG = {
     fadeTime     = 0.25,     -- vehicle fade-out (then destroyed), same idea as the game's own 0.2
     leaveMargin  = 3,        -- a pending delivery is cancelled once the vehicle is this far outside the radius
     scanRange    = 60,       -- only query a point for vehicles when a player is this close
-    rgb          = { 60, 184, 120 },
+    rgb          = { 60, 184, 120 }, -- "Secondary Objective Green" sourced from the Mercs 1 HUD.ini
     discAlpha    = 0.25,
 
-    -- Every delivery point is a fixed world position (x, y, z) and radius; nothing is looked up at runtime.
+    -- Every delivery point is a fixed world position and radius; nothing is looked up at runtime.
     zones = {
         { id = "garage",  label = "Garage",  radius = 5,
-          x = 2654.3125, y = -13.828918457031, z = -928.89282226563,
+          pos = garagePos,
           physics = { car = true, tank = true } },
         { id = "helipad", label = "Helipad", radius = 15,
-          x = 2632.8032226563, y = 8.0310926437378, z = -885.96362304688,
+          pos = helipadPos,
           physics = { helicopter = true }, mustBeGrounded = true },
         -- The dock delivers the moment a boat enters the marker (autoDeliver): the driver is ejected and
-        -- moved to `exit`, then the boat is deleted and stockpiled.
+        -- moved to `exitPos`, then the boat is deleted and stockpiled.
         { id = "dock",    label = "Boat Dock", radius = 10,
-          x = 2546.6, y = -36.1, z = -789.4,
-          autoDeliver = true, exitPos = { 2531.0, -32.0, -799.0 },
+          pos = dockPos,
+          autoDeliver = true, exitPos = { 2531.0, -32.0, -799.0 }, -- actual position embedded inside the source
           physics = { boat = true } },
     },
 }
@@ -93,7 +101,7 @@ end
 local function showMarker(zone)
     if not zone.marker then
         if zone.nextTry and tickCount < zone.nextTry then return end
-        zone.marker = Ess.Mark.zone(zone.x, zone.y, zone.z, zone.radius, {
+        zone.marker = Ess.Mark.zone(zone.pos.x, zone.pos.y, zone.pos.z, zone.radius, {
             kind = "deliverable", icon = true, rgb = CFG.rgb, discAlpha = CFG.discAlpha,
             label = "Stockpile Delivery: " .. zone.label,
         })
@@ -229,13 +237,13 @@ local function arm(veh, zone, key, sSupport, sName)
     local p = newDelivery(veh, zone, key, sSupport, sName)
     p.pi = pi
     pending[key] = p
-    hint("Step out of the vehicle to add it to the stockpile.")
+    hint("Exit the vehicle to complete delivery.")
 end
 
 local function cancel(key, why)
     pending[key] = nil
     busy[key] = nil
-    log("delivery cancelled (" .. why .. ")")
+    log("Delivery cancelled (" .. why .. ")")
 end
 
 -- Steps 2-4, once the player is out: delete the vehicle, add every array entry to the stockpile, fanfare.
@@ -270,7 +278,7 @@ end
 -- (MrxUtil.TeleportHeroesToLocations; raw SetPosition is unreliable on characters). It moves every connected
 -- hero, so in co-op both players arrive at the exit.
 local function movePlayer(zone)
-    local e = zone.exit
+    local e = zone.exitPos
     if e then Ess.Player.teleport(e[1], e[2], e[3], 0) end
 end
 
@@ -293,7 +301,7 @@ local function checkPending()
         if not Ess.Object.valid(p.veh) then
             cancel(key, "vehicle gone")
         else
-            local d = Ess.Object.distance(p.veh, p.zone.x, p.zone.y, p.zone.z)
+            local d = Ess.Object.distance(p.veh, p.zone.pos.x, p.zone.pos.y, p.zone.pos.z)
             if d and d > p.zone.radius + CFG.leaveMargin then
                 cancel(key, "left the delivery point")
             elseif inVehicleKey(p.pi) == key then
@@ -322,7 +330,7 @@ local function once(seen, flagKey, sText)
 end
 
 local function scanZone(zone, seen)
-    local vehicles = Ess.Probe.inArea(zone.x, zone.y, zone.z, zone.radius, "Vehicle")
+    local vehicles = Ess.Probe.inArea(zone.pos.x, zone.pos.y, zone.pos.z, zone.radius, "Vehicle")
     for _, veh in ipairs(vehicles) do
         local key = keyOf(veh)
         if not busy[key] then
@@ -364,7 +372,7 @@ end
 local function scanTick()
     local seen = {}
     for _, zone in ipairs(CFG.zones) do
-        local d = playerDistance(zone.x, zone.y, zone.z)
+        local d = playerDistance(zone.pos.x, zone.pos.y, zone.pos.z)
         if d and d <= CFG.scanRange then scanZone(zone, seen) end
     end
     -- Forget a hint once its vehicle has left the point, so it can be shown again next visit.
