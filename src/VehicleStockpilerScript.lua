@@ -20,7 +20,8 @@ pcall(import, "MrxSupportData")
 -- HOW IT WORKS
 --   1. Drive a vehicle into a delivery point (garage / helipad / boat dock). On entry the delivery array is
 --      built:  { { vTemplate = <vehicle template>, nQty = 1, ... } }
---   2. The player stays in control. Nobody is ejected.
+--   2. The player stays in control. Nobody is ejected. (Exception: the boat dock, which delivers at once --
+--      see `autoDeliver` on the dock zone.)
 --   3. When the player is no longer in that vehicle (Ess.Player.inVehicle(i) turns nil/false/0), the vehicle
 --      is deleted from the world, every entry in the array is added to the stockpile, and the "stockpile"
 --      fanfare banner is shown (Hud.EventFanfare:Commence only -- no music).
@@ -40,7 +41,7 @@ local CFG = {
     markerRange  = 400,      -- draw a delivery point's markers when a player is this close...
     markerHide   = 500,      -- ...and remove them again beyond this (hysteresis, avoids flicker)
     scanRange    = 60,       -- only query a point for vehicles when a player is this close
-    rgb          = { 60, 200, 255 },
+    rgb          = { 154, 205, 50 },
     discAlpha    = 0.25,
 
     -- A zone resolves its position from the named dropoff object, unless it has a fixed `pos` = { x, y, z }.
@@ -49,8 +50,12 @@ local CFG = {
           physics = { car = true, tank = true } },
         { id = "helipad", label = "Helipad", dropoff = "PMC Helipad Dropoff", radius = 15,
           physics = { helicopter = true }, mustBeGrounded = true },
+        -- The dock delivers the moment a boat enters the marker: the driver is ejected and moved to the
+        -- first exit point, then the boat is deleted and stockpiled (autoDeliver). If that exit object can't
+        -- be found, the player is moved to the marker position instead.
         { id = "dock",    label = "Boat Dock", dropoff = "PMC Dock Dropoff",  radius = 10,
           pos = { 2546.6, -36.3, -789.4 },
+          autoDeliver = true, exits = { "PMC Dock Exit 1", "PMC Dock Exit 2" },
           physics = { boat = true } },
     },
 }
@@ -207,6 +212,16 @@ end
 -- Object.GetParent on a spawned vehicle is its template, the same lookup the game's garage uses for storage
 -- (wifpmcgarage.lua, _AddVehicle). nBefore is the stock at this moment, so that if the game's own garage
 -- script counts the vehicle when the player steps out inside the HQ regions it is not added twice.
+local function newDelivery(veh, zone, key, sSupport, sName)
+    return {
+        veh = veh, zone = zone, key = key,
+        tDelivery = {
+            { vTemplate = Ess.Object.parent(veh), nQty = 1, sSupport = sSupport, sName = sName,
+              nBefore = qtyOf(sSupport) },
+        },
+    }
+end
+
 local function arm(veh, zone, key, sSupport, sName)
     local pi
     for i = 0, 1 do
@@ -215,13 +230,9 @@ local function arm(veh, zone, key, sSupport, sName)
     if not pi then return end   -- nobody readable in the seat yet; try again next tick
 
     busy[key] = true
-    pending[key] = {
-        veh = veh, zone = zone, key = key, pi = pi,
-        tDelivery = {
-            { vTemplate = Ess.Object.parent(veh), nQty = 1, sSupport = sSupport, sName = sName,
-              nBefore = qtyOf(sSupport) },
-        },
-    }
+    local p = newDelivery(veh, zone, key, sSupport, sName)
+    p.pi = pi
+    pending[key] = p
     hint("Step out of the vehicle to add it to the stockpile.")
 end
 
@@ -257,6 +268,30 @@ local function complete(p)
     end
 
     if #added > 0 then fanfare(added) end
+end
+
+-- Put the player on the zone's exit point (the same call the game's garage uses). If the exit object can't be
+-- found, fall back to the marker position.
+local function movePlayer(char, zone)
+    if not (char and Ess.Object.valid(char)) then return end
+    local sExit = zone.exits and zone.exits[1]
+    if sExit and Ess.Guid(sExit) then
+        Ess.Safe.quiet(Object.SetTransformToObject, char, sExit)
+    else
+        Ess.Player.teleport(zone.x, zone.y, zone.z, 0)
+    end
+end
+
+-- autoDeliver zones (the boat dock): no waiting for the player. Build the array, eject the driver, move them
+-- to the exit point, then delete the vehicle, stockpile it and show the fanfare.
+local function deliverNow(veh, driver, zone, key, sSupport, sName)
+    busy[key] = true
+    local p = newDelivery(veh, zone, key, sSupport, sName)
+    Ess.Vehicle.exit(veh, driver)
+    Ess.Event.on(Event.TimerRelative, { CFG.settleDelay }, function()
+        movePlayer(driver, zone)
+        complete(p)
+    end)
 end
 
 -- Runs every tick for armed deliveries (whatever the distance to the player).
@@ -304,7 +339,11 @@ local function scan(zone, seen)
                 if ok then
                     local sId, sName = supportFor(veh, key)
                     if sId then
-                        arm(veh, zone, key, sId, sName)
+                        if zone.autoDeliver then
+                            deliverNow(veh, driver, zone, key, sId, sName)
+                        else
+                            arm(veh, zone, key, sId, sName)
+                        end
                     else
                         once(seen, key .. "|nosupport", "This vehicle can't be added to the stockpile.")
                     end
@@ -347,80 +386,56 @@ local function tick()
         if not seen[k] then notified[k] = nil end
     end
 end
-local function start()
+
+-- ---------------------------------------------------------------------------------------------------------
+-- On / off
+-- ---------------------------------------------------------------------------------------------------------
+local function wipeState()
+    for k in pairs(pending)  do pending[k]  = nil end
+    for k in pairs(busy)     do busy[k]     = nil end
+    for k in pairs(notified) do notified[k] = nil end
+    for _, zone in ipairs(CFG.zones) do
+        dropMarker(zone)
+        zone.nextTry, zone.markerCheck = nil, nil
+    end
+end
+
+local function enable(bQuiet)
+    if enabled then return end
+    enabled = true
     Ess.Loop.start(CFG.loopId, CFG.scanInterval, function()
         local ok, err = pcall(tick)
         if not ok then log("tick error: " .. tostring(err)) end
         return true   -- never let one bad tick end the listener
     end)
-    log("delivery points armed: garage, helipad, boat dock")
+    log("ON - delivery points armed: garage, helipad, boat dock")
+    if not bQuiet then hint("Vehicle Stockpiler: ON") end
 end
- 
-local function stop()
+
+local function disable(bQuiet)
+    if not enabled then return end
+    enabled = false
     Ess.Loop.stop(CFG.loopId)
-    for _, zone in ipairs(CFG.zones) do dropMarker(zone) end
-end
- 
--- ---------------------------------------------------------------------------------------------------------
--- On / off with KEYVAL
--- ---------------------------------------------------------------------------------------------------------
--- Off = the listener loop is stopped and every marker removed. A key-bound script is re-run in full on each
--- press, while an OnLoad script is not, so this works either way: the key is also bound through Ess.Keys, and
--- a toggle within TOGGLE_DEBOUNCE seconds of another one is treated as the same keypress.
-local TOGGLE_DEBOUNCE = 0.3
-
-local function justToggled()
-    local st = _G._VSS_toggleStamp
-    return st ~= nil and Ess.Time.elapsed(st) < TOGGLE_DEBOUNCE
+    wipeState()   -- markers removed; any armed delivery is dropped and its vehicle left alone
+    log("OFF")
+    if not bQuiet then hint("Vehicle Stockpiler: OFF") end
 end
 
-local function markToggle(bFresh)
-    local st = _G._VSS_toggleStamp
-    if st and not bFresh then Ess.Time.mark(st) else _G._VSS_toggleStamp = Ess.Time.stamp() end
+local function toggle()
+    if enabled then disable() else enable() end
 end
 
-local api = { CFG = CFG, enabled = false, start = start, stop = stop }
-
-function api.setEnabled(bOn, bQuiet)
-    bOn = bOn and true or false
-    if bOn and not api.enabled then
-        api.enabled = true
-        start()
-    elseif not bOn and api.enabled then
-        api.enabled = false
-        stop()
-    end
-    if not bQuiet then hint("Vehicle Stockpiler: " .. (api.enabled and "ON" or "OFF")) end
+local function stop()
+    disable(true)
+    if Ess.Keys and Ess.Keys.off then Ess.Keys.off(KEYVAL) end
 end
 
-function api.toggle()
-    if justToggled() then return end
-    markToggle()
-    api.setEnabled(not api.enabled)
-end
+_G.VehicleStockpiler = { CFG = CFG, start = enable, stop = stop, toggle = toggle }
 
--- Always dispatch to whichever instance is current, so a re-run never leaves a stale handler behind.
-function api.onKey()
-    local cur = _G.VehicleStockpiler
-    if cur and cur.toggle then cur.toggle() end
-end
-
-_G.VehicleStockpiler = api
-
--- Ess.Keys bindings are wiped by a level reload, so our handler still being bound means this is a re-run in
--- the same world (a keypress), not a fresh load.
-local vk = Ess.Keys.vk(KEYVAL)
-local rerun = prior ~= nil and vk ~= nil and Ess.Keys._map[vk] == prior.onKey
-Ess.Keys.on(KEYVAL, api.onKey)
-
-if rerun then
-    if justToggled() then
-        api.setEnabled(prior.enabled, true)      -- the key listener already handled this very press
-    else
-        markToggle()
-        api.setEnabled(not prior.enabled)        -- this re-run IS the press
-    end
+if Ess.Keys and Ess.Keys.on then
+    Ess.Keys.on(KEYVAL, toggle)
 else
-    markToggle(true)                             -- fresh stamp; also swallows the press that launched us
-    api.setEnabled(true)                         -- fresh load: armed
+    log("Ess.Keys is not available; the " .. tostring(KEYVAL) .. " toggle key is disabled")
 end
+
+enable(true)
